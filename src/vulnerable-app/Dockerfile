@@ -1,6 +1,16 @@
 # src/vulnerable-app/Dockerfile
 FROM node:18-alpine
 
+# Install Python and build dependencies for bcrypt
+RUN apk add --no-cache \
+    python3 \
+    py3-pip \
+    make \
+    g++ \
+    gcc \
+    libc-dev \
+    linux-headers
+
 # Create app directory
 WORKDIR /usr/src/app
 
