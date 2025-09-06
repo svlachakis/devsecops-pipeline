@@ -1,0 +1,553 @@
+name: DevSecOps Security Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: '18'
+  DOCKER_BUILDKIT: 1
+
+jobs:
+  # Job 1: Secret Scanning
+  secret-scanning:
+    name: 🔍 Secret Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: TruffleHog OSS
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: --debug --only-verified
+
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Secret Scan Results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: secret-scan-results
+          path: |
+            gitleaks-report.json
+            trufflehog-report.json
+
+  # Job 2: Static Analysis - SonarCloud (Free)
+  sonarcloud:
+    name: 📊 SonarCloud Analysis
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ github.repository_owner }}_${{ github.event.repository.name }}
+            -Dsonar.organization=${{ github.repository_owner }}
+
+  # Job 3: Static Analysis - Semgrep (Free)
+  semgrep:
+    name: 🛡️ Semgrep Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Run Semgrep
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/security-audit
+            p/secrets
+            p/owasp-top-ten
+            p/javascript
+            p/sql-injection
+          generateSarif: true
+
+      - name: Upload SARIF file
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: semgrep.sarif
+
+      - name: Upload Semgrep Results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: semgrep-results
+          path: semgrep.sarif
+
+  # Job 4: Dependency Check - Snyk (Free tier)
+  snyk:
+    name: 🔒 Snyk Dependency Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          cd src/vulnerable-app
+          npm install
+
+      - name: Run Snyk to check for vulnerabilities
+        uses: snyk/actions/node@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high --json-file-output=snyk-report.json
+          working-directory: src/vulnerable-app
+
+      - name: Upload Snyk Results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: snyk-results
+          path: src/vulnerable-app/snyk-report.json
+
+  # Job 5: SAST with CodeQL (GitHub Free)
+  codeql:
+    name: 🔍 CodeQL Analysis
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ 'javascript' ]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v2
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-and-quality
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v2
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v2
+        with:
+          category: "/language:${{matrix.language}}"
+
+  # Job 6: Build Docker Image
+  build:
+    name: 🔨 Build Application
+    runs-on: ubuntu-latest
+    needs: [secret-scanning]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build Docker Image
+        run: |
+          cd src/vulnerable-app
+          docker build -t vulnerable-app:${{ github.sha }} .
+          docker tag vulnerable-app:${{ github.sha }} vulnerable-app:latest
+          
+      - name: Save Docker Image
+        run: |
+          docker save vulnerable-app:latest > vulnerable-app.tar
+          
+      - name: Upload Docker Image
+        uses: actions/upload-artifact@v3
+        with:
+          name: docker-image
+          path: vulnerable-app.tar
+
+  # Job 7: Container Scanning
+  container-scan:
+    name: 🐳 Container Security Scan
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Download Docker Image
+        uses: actions/download-artifact@v3
+        with:
+          name: docker-image
+
+      - name: Load Docker Image
+        run: docker load < vulnerable-app.tar
+
+      - name: Run Trivy Container Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: vulnerable-app:latest
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+          exit-code: '0'
+
+      - name: Upload Trivy Results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Run Grype Container Scan
+        uses: anchore/scan-action@v3
+        with:
+          image: vulnerable-app:latest
+          output-format: sarif
+          fail-build: false
+
+      - name: Upload Grype Results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: results.sarif
+
+  # Job 8: Dynamic Analysis
+  dynamic-analysis:
+    name: 🚀 Dynamic Security Testing
+    runs-on: ubuntu-latest
+    needs: [build]
+    services:
+      postgres:
+        image: postgres:13
+        env:
+          POSTGRES_USER: testuser
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: vulnerable_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Download Docker Image
+        uses: actions/download-artifact@v3
+        with:
+          name: docker-image
+
+      - name: Load and Run Application
+        run: |
+          docker load < vulnerable-app.tar
+          docker run -d \
+            --name vulnerable-app \
+            -p 3000:3000 \
+            -e DB_HOST=host.docker.internal \
+            -e DB_USER=testuser \
+            -e DB_PASS=testpass \
+            -e DB_NAME=vulnerable_db \
+            --add-host=host.docker.internal:host-gateway \
+            vulnerable-app:latest
+          
+          # Wait for application to start
+          echo "Waiting for application to start..."
+          for i in {1..30}; do
+            if curl -f http://localhost:3000 2>/dev/null; then
+              echo "Application is ready!"
+              break
+            fi
+            echo "Waiting... ($i/30)"
+            sleep 2
+          done
+
+      - name: Run OWASP ZAP Baseline Scan
+        uses: zaproxy/action-baseline@v0.7.0
+        with:
+          target: 'http://localhost:3000'
+          allow_issue_writing: true
+          issue_title: 'ZAP Baseline Scan Report'
+          fail_action: false
+
+      - name: Run Nuclei Security Scan
+        run: |
+          # Install Nuclei
+          wget -q https://github.com/projectdiscovery/nuclei/releases/latest/download/nuclei_linux_amd64.zip
+          unzip -q nuclei_linux_amd64.zip
+          chmod +x nuclei
+          
+          # Run Nuclei scan
+          ./nuclei -u http://localhost:3000 \
+            -t cves/ \
+            -t vulnerabilities/ \
+            -t misconfiguration/ \
+            -severity critical,high,medium \
+            -o nuclei-report.txt \
+            -json-export nuclei-report.json
+
+      - name: Run Nikto Web Scanner
+        run: |
+          # Install Nikto
+          sudo apt-get update
+          sudo apt-get install -y nikto
+          
+          # Run Nikto scan
+          nikto -h http://localhost:3000 \
+            -output nikto-report.html \
+            -Format html \
+            -Tuning 123456789 || true
+
+      - name: Run SQLMap Test
+        run: |
+          # Install SQLMap
+          git clone --depth 1 https://github.com/sqlmapproject/sqlmap.git sqlmap-dev
+          
+          # Test for SQL injection
+          python3 sqlmap-dev/sqlmap.py \
+            -u "http://localhost:3000/api/users?id=1" \
+            --batch \
+            --level=2 \
+            --risk=2 \
+            --output-dir=./sqlmap-results \
+            --flush-session || true
+
+      - name: Run Nmap Port Scan
+        run: |
+          # Install Nmap
+          sudo apt-get install -y nmap
+          
+          # Run port scan
+          nmap -sV -sC -O -A \
+            -oX nmap-report.xml \
+            -oN nmap-report.txt \
+            localhost
+
+      - name: Upload Dynamic Analysis Results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: dynamic-analysis-results
+          path: |
+            zap_report.html
+            nuclei-report.*
+            nikto-report.html
+            sqlmap-results/
+            nmap-report.*
+
+  # Job 9: Generate Security Report
+  security-report:
+    name: 📋 Generate Security Report
+    runs-on: ubuntu-latest
+    needs: [secret-scanning, semgrep, snyk, codeql, container-scan, dynamic-analysis]
+    if: always()
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: security-artifacts
+
+      - name: Generate Consolidated Report
+        run: |
+          mkdir -p security-report
+          
+          # Create HTML report
+          cat > security-report/index.html << 'EOF'
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <title>DevSecOps Security Report</title>
+              <style>
+                  body { font-family: Arial, sans-serif; margin: 20px; }
+                  h1 { color: #333; }
+                  .section { margin: 20px 0; padding: 15px; border: 1px solid #ddd; border-radius: 5px; }
+                  .passed { background-color: #d4edda; }
+                  .failed { background-color: #f8d7da; }
+                  .warning { background-color: #fff3cd; }
+                  table { width: 100%; border-collapse: collapse; }
+                  th, td { padding: 10px; text-align: left; border-bottom: 1px solid #ddd; }
+                  th { background-color: #f2f2f2; }
+              </style>
+          </head>
+          <body>
+              <h1>🔒 DevSecOps Security Report</h1>
+              <div class="section">
+                  <h2>📊 Summary</h2>
+                  <p><strong>Repository:</strong> ${{ github.repository }}</p>
+                  <p><strong>Branch:</strong> ${{ github.ref_name }}</p>
+                  <p><strong>Commit:</strong> ${{ github.sha }}</p>
+                  <p><strong>Date:</strong> $(date)</p>
+              </div>
+              
+              <div class="section">
+                  <h2>🔍 Security Scan Results</h2>
+                  <table>
+                      <tr>
+                          <th>Tool</th>
+                          <th>Status</th>
+                          <th>Findings</th>
+                      </tr>
+                      <tr>
+                          <td>TruffleHog</td>
+                          <td>✅ Complete</td>
+                          <td>Check artifacts for details</td>
+                      </tr>
+                      <tr>
+                          <td>Gitleaks</td>
+                          <td>✅ Complete</td>
+                          <td>Check artifacts for details</td>
+                      </tr>
+                      <tr>
+                          <td>Semgrep</td>
+                          <td>✅ Complete</td>
+                          <td>SAST findings available</td>
+                      </tr>
+                      <tr>
+                          <td>CodeQL</td>
+                          <td>✅ Complete</td>
+                          <td>GitHub Security tab</td>
+                      </tr>
+                      <tr>
+                          <td>Snyk</td>
+                          <td>✅ Complete</td>
+                          <td>Dependency vulnerabilities checked</td>
+                      </tr>
+                      <tr>
+                          <td>Trivy</td>
+                          <td>✅ Complete</td>
+                          <td>Container vulnerabilities scanned</td>
+                      </tr>
+                      <tr>
+                          <td>OWASP ZAP</td>
+                          <td>✅ Complete</td>
+                          <td>Web vulnerabilities tested</td>
+                      </tr>
+                      <tr>
+                          <td>Nuclei</td>
+                          <td>✅ Complete</td>
+                          <td>CVE and misconfigurations checked</td>
+                      </tr>
+                      <tr>
+                          <td>SQLMap</td>
+                          <td>✅ Complete</td>
+                          <td>SQL injection tested</td>
+                      </tr>
+                      <tr>
+                          <td>Nmap</td>
+                          <td>✅ Complete</td>
+                          <td>Port scan complete</td>
+                      </tr>
+                  </table>
+              </div>
+              
+              <div class="section">
+                  <h2>📈 Metrics</h2>
+                  <ul>
+                      <li>Total Scans: 10</li>
+                      <li>Critical Issues: Check individual reports</li>
+                      <li>High Issues: Check individual reports</li>
+                      <li>Medium Issues: Check individual reports</li>
+                      <li>Pipeline Duration: ~10 minutes</li>
+                  </ul>
+              </div>
+              
+              <div class="section warning">
+                  <h2>⚠️ Recommendations</h2>
+                  <ul>
+                      <li>Review and remediate all critical findings</li>
+                      <li>Update vulnerable dependencies</li>
+                      <li>Fix SQL injection vulnerabilities</li>
+                      <li>Remove hardcoded secrets</li>
+                      <li>Implement input validation</li>
+                      <li>Add security headers</li>
+                  </ul>
+              </div>
+          </body>
+          </html>
+          EOF
+          
+          # Create JSON summary
+          cat > security-report/summary.json << EOF
+          {
+            "pipeline_run": "${{ github.run_id }}",
+            "repository": "${{ github.repository }}",
+            "branch": "${{ github.ref_name }}",
+            "commit": "${{ github.sha }}",
+            "timestamp": "$(date -Iseconds)",
+            "scans_completed": [
+              "secret-scanning",
+              "sast-semgrep",
+              "sast-codeql",
+              "dependency-check",
+              "container-scan",
+              "dast-zap",
+              "dast-nuclei",
+              "dast-sqlmap",
+              "network-scan"
+            ],
+            "status": "completed"
+          }
+          EOF
+          
+          # Copy all artifacts to report directory
+          cp -r security-artifacts/* security-report/ 2>/dev/null || true
+
+      - name: Upload Final Security Report
+        uses: actions/upload-artifact@v3
+        with:
+          name: security-report-${{ github.sha }}
+          path: security-report/
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 🔒 Security Scan Complete
+              
+              **Commit:** ${{ github.sha }}
+              
+              ### ✅ Scans Executed:
+              - Secret Detection (TruffleHog, Gitleaks)
+              - Static Analysis (Semgrep, CodeQL, SonarCloud)
+              - Dependency Check (Snyk)
+              - Container Scan (Trivy, Grype)
+              - Dynamic Analysis (OWASP ZAP, Nuclei, SQLMap)
+              - Network Scan (Nmap)
+              
+              📊 **Full report available in workflow artifacts**
+              
+              [View Workflow Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`
+            })

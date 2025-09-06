@@ -1,0 +1,42 @@
+{
+  "name": "vulnerable-app",
+  "version": "1.0.0",
+  "description": "Intentionally vulnerable application for DevSecOps testing",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js",
+    "dev": "nodemon app.js",
+    "test": "echo \"No tests implemented\"",
+    "security-check": "npm audit"
+  },
+  "keywords": [
+    "vulnerable",
+    "devsecops",
+    "testing"
+  ],
+  "author": "DevSecOps Team",
+  "license": "MIT",
+  "dependencies": {
+    "express": "4.16.0",
+    "mysql": "2.18.1",
+    "body-parser": "1.18.2",
+    "cookie-parser": "1.4.3",
+    "jsonwebtoken": "8.0.0",
+    "bcrypt": "3.0.0",
+    "lodash": "4.17.4",
+    "moment": "2.19.0",
+    "request": "2.81.0",
+    "xmldom": "0.1.27",
+    "node-serialize": "0.0.4",
+    "js-yaml": "3.10.0",
+    "handlebars": "4.0.11",
+    "marked": "0.3.6",
+    "validator": "9.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "2.0.20"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}

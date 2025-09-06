@@ -1,0 +1,105 @@
+version: '3.8'
+
+services:
+  # Vulnerable Application
+  vulnerable-app:
+    build:
+      context: ./src/vulnerable-app
+      dockerfile: Dockerfile
+    container_name: vulnerable-app
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=development
+      - DB_HOST=postgres
+      - DB_USER=vulnerable_user
+      - DB_PASS=vulnerable_pass
+      - DB_NAME=vulnerable_db
+    depends_on:
+      - postgres
+    networks:
+      - devsecops-net
+
+  # PostgreSQL Database
+  postgres:
+    image: postgres:13-alpine
+    container_name: postgres-db
+    environment:
+      POSTGRES_USER: vulnerable_user
+      POSTGRES_PASSWORD: vulnerable_pass
+      POSTGRES_DB: vulnerable_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - devsecops-net
+
+  # OWASP ZAP for Dynamic Testing (Free)
+  zap:
+    image: owasp/zap2docker-stable
+    container_name: zap-scanner
+    command: zap.sh -daemon -host 0.0.0.0 -port 8090 -config api.addrs.addr.name=.* -config api.addrs.addr.regex=true -config api.disablekey=true
+    ports:
+      - "8090:8090"
+      - "8091:8091"
+    networks:
+      - devsecops-net
+
+  # SonarQube Community Edition (Free)
+  sonarqube:
+    image: sonarqube:community
+    container_name: sonarqube
+    ports:
+      - "9000:9000"
+    environment:
+      - SONAR_ES_BOOTSTRAP_CHECKS_DISABLE=true
+      - SONAR_TELEMETRY_ENABLE=false
+    volumes:
+      - sonarqube_data:/opt/sonarqube/data
+      - sonarqube_extensions:/opt/sonarqube/extensions
+      - sonarqube_logs:/opt/sonarqube/logs
+    networks:
+      - devsecops-net
+
+  # Grafana for Monitoring (Free)
+  grafana:
+    image: grafana/grafana-oss:latest
+    container_name: grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_INSTALL_PLUGINS=
+    volumes:
+      - grafana_data:/var/lib/grafana
+    networks:
+      - devsecops-net
+
+  # Prometheus for Metrics (Free)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    networks:
+      - devsecops-net
+
+volumes:
+  postgres_data:
+  sonarqube_data:
+  sonarqube_extensions:
+  sonarqube_logs:
+  grafana_data:
+  prometheus_data:
+
+networks:
+  devsecops-net:
+    driver: bridge
